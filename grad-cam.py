@@ -21,74 +21,6 @@ transform = transforms.Compose([
 ])
 
 
-class ModelOutputs:
-    """ Class for making a forward pass, and getting:
-    1. The network output.
-    2. Activations from intermeddiate targetted layers."""
-
-    def __init__(self, model, target_layers):
-        self.model = model
-        self.target_layers = target_layers
-
-    def __call__(self, x):
-        self.model.zero_grad()
-        target_activations = []
-        for name, module in self.model.features._modules.items():
-            x = module(x)
-            if name in self.target_layers:
-                target_activations += [x]
-
-        x = x.view(x.size(0), -1)
-        output = self.model.classifier(x)
-        return target_activations, output
-
-
-def show_cam_on_image(img, mask, file_name):
-    mask = mask.data.cpu().numpy().transpose((1, 2, 0))
-    heatmap = cv2.applyColorMap(np.uint8(255 * mask), cv2.COLORMAP_JET)
-    heatmap = np.float32(heatmap) / 255
-
-    img *= torch.FloatTensor(std)[:, None, None]
-    img += torch.FloatTensor(mean)[:, None, None]
-    img = img.permute(1, 2, 0).numpy()
-
-    cam = heatmap + img
-    cam = cam / np.max(cam)
-    cv2.imwrite(file_name, np.uint8(255 * cam))
-
-
-class GradCam(nn.Module):
-    def __init__(self, model, target_layer_names):
-        super(GradCam, self).__init__()
-        self.model = ModelOutputs(model, target_layer_names)
-
-    def forward(self, input, index=None):
-        features, output = self.model(input)
-
-        if index is None:
-            one_hot = output.max()  # choose the target output, in this case, choose the maximum activation
-        else:
-            one_hot = output[index]
-
-        feature = features[-1]
-        feature.retain_grad()
-
-        one_hot.backward(torch.ones_like(one_hot), retain_graph=True)
-
-        grads_val, target = feature.grad, feature
-        weights = grads_val.mean(-1).mean(-1)[:, :, None, None]
-
-        cam = ((weights * target).sum(1) + 1)
-        cam = torch.clamp(cam, min=0)
-
-        min = cam.min(-1)[0].min(-1)[0][:, None, None]
-        max = cam.max(-1)[0].max(-1)[0][:, None, None]
-        cam = (cam - min) / (max - min)
-
-        mask = F.upsample(cam[:, None, :, :], (224, 224), mode='bilinear')
-        return mask
-
-
 class GuidedBackpropReLU(Function):
 
     def forward(self, input):
@@ -111,44 +43,81 @@ class GuidedBackpropReLU(Function):
         return []
 
 
-class GuidedBackpropReLUModel(nn.Module):
-    def __init__(self, model):
-        super(GuidedBackpropReLUModel, self).__init__()
-        self.model = model
+class MyModel(nn.Module):
+    """ Define your model here"""
+
+    def __init__(self, args):
+        super(MyModel, self).__init__()
+        model = getattr(models, args.model_name)(pretrained=True)
+        self.base_model = nn.Sequential(*list(model.features.children())[:-1])
+        self.classifier = model.classifier
 
         # replace ReLU with GuidedBackpropReLU
-        for idx, module in self.model.features._modules.items():
-            if module.__class__.__name__ == 'ReLU':
-                self.model.features._modules[idx] = GuidedBackpropReLU()
+        modules = {**self.base_model._modules, **self.classifier._modules}
+        for idx, module in modules.items():
+            if isinstance(module, nn.ReLU):
+                modules[idx] = GuidedBackpropReLU()
 
-    def forward(self, input, index=None):
-        output = self.model(input)
-        input.retain_grad()
+    def __call__(self, x):
 
-        if index is None:
-            one_hot = output.max()  # choose the target output, in this case, choose the maximum activation
-        else:
-            one_hot = output[index]
+        x1 = self.base_model(x)
+        x = F.max_pool2d(x1, 2)
+        x = x.view(x.size(0), -1)
+        output = self.classifier(x)
 
-        one_hot.backward(torch.ones_like(one_hot), retain_graph=True)
+        return x1, output
 
-        output = input.grad[0]
 
-        return output
+def show_cam_on_image(img, mask, file_name):
+    mask = mask.permute(1, 2, 0).cpu().numpy()
+    heatmap = cv2.applyColorMap(np.uint8(255 * mask), cv2.COLORMAP_JET)
+    heatmap = np.float32(heatmap) / 255
+
+    img *= torch.FloatTensor(std)[:, None, None]
+    img += torch.FloatTensor(mean)[:, None, None]
+    img = img.permute(1, 2, 0).numpy()
+
+    cam = heatmap + img
+    cam = cam / np.max(cam)
+    cv2.imwrite(file_name, np.uint8(255 * cam))
 
 
 class GuidedGradCam(nn.Module):
-
     def __init__(self, args):
         super(GuidedGradCam, self).__init__()
-        model = getattr(models, args.model_name)(pretrained=True)
-        self.grad_cam = GradCam(model=model, target_layer_names=target_layer_name)
-        self.gbp = GuidedBackpropReLUModel(model=model)
+        self.model = MyModel(args)
+        self.model.eval()
 
-    def forward(self, input, target_index):
-        mask = self.grad_cam(input, target_index)
-        gb = self.gbp(input, target_index)
-        cam_gb = mask * gb[None, ...]
+    def forward(self, input, indices=None):
+        feature, output = self.model(input)
+
+        feature.retain_grad()
+        input.retain_grad()
+
+        if indices:
+            indices = Variable(torch.LongTensor(indices)).long().view(-1, 1).cuda()
+            one_hot = output.gather(1, indices)
+        else:
+            one_hot = output.max(-1)[0]  # choose the target output, in this case, choose the maximum activations
+
+        self.model.zero_grad()
+
+        one_hot.backward(torch.ones_like(one_hot))
+
+        grads_val, target = feature.grad, feature
+        weights = F.avg_pool2d(grads_val, grads_val.size(-1))
+
+        cam = ((weights * target).sum(1) + 1)
+        cam = torch.clamp(cam, min=0)
+
+        min = -F.max_pool2d(-cam, cam.size(-1))
+        max = F.max_pool2d(cam, cam.size(-1))
+        cam = (cam - min) / (max - min)
+
+        mask = F.upsample(cam[:, None, :, :], (224, 224), mode='bilinear')
+
+        gb = input.grad
+        cam_gb = mask * gb
         return mask, gb, cam_gb
 
 
@@ -186,11 +155,10 @@ if __name__ == '__main__':
 
     # If None, returns the map for the highest scoring category.
     # Otherwise, targets the requested index.
-    target_index = None
-    target_layer_name = ['35']
+    target_index = [243, 281]
 
     img = Image.open(args.image_path)
-    img = transform(img)[None, :, :, :]
+    img = transform(img)[None, :, :, :].repeat(2, 1, 1, 1)
     input = Variable(img, requires_grad=True)
 
     model = GuidedGradCam(args)
@@ -202,6 +170,7 @@ if __name__ == '__main__':
     cam, gb, cam_gb = model(input, target_index)  # fully differentiable
 
     # visualize and save example
-    show_cam_on_image(img[0], cam[0], 'cam.jpg')
-    utils.save_image(gb.data, 'gb.jpg')
-    utils.save_image(cam_gb.data, 'cam_gb.jpg')
+    for i in range(cam.size(0)):
+        show_cam_on_image(img[i], cam[i].data, 'examples/cam_{}.jpg'.format(i))
+        utils.save_image(gb[i].data, 'examples/gb_{}.jpg'.format(i))
+        utils.save_image(cam_gb[i].data, 'examples/cam_gb_{}.jpg'.format(i))

@@ -24,7 +24,8 @@ This code assumes that the model passed supports these two methods.
 
 Differences with original code:
 * Rewrite all classes which are more efficient that original ones
-* Write new class GuidedGradCam, which combines GradCam and GuidedBackpropReLUModel, is fully differentiable so you can use for another job like feeding the output to another network  
+* Write new class GuidedGradCam, which combines GradCam and GuidedBackpropReLUModel, is fully differentiable so you can use for another job like feeding the output to another network
+* We just need one backpropagation for both CAM and GuidedBackpropagation
 
 
 ----------
