@@ -105,10 +105,11 @@ class GuidedGradCam(nn.Module):
         one_hot.backward(torch.ones_like(one_hot))
 
         grads_val, target = feature.grad, feature
+        grads_val = F.relu(grads_val)
         weights = F.avg_pool2d(grads_val, grads_val.size(-1))
 
         cam = ((weights * target).sum(1) + 1)
-        cam = torch.clamp(cam, min=0)
+        cam = F.relu(cam)
 
         min = -F.max_pool2d(-cam, cam.size(-1))
         max = F.max_pool2d(cam, cam.size(-1))
