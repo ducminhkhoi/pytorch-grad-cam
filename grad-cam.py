@@ -106,7 +106,7 @@ class GuidedGradCam(nn.Module):
 
         grads_val, target = feature.grad, feature
         grads_val = F.relu(grads_val)
-        weights = F.avg_pool2d(grads_val, grads_val.size(-1))
+        weights = F.adapative_avg_pool2d(grads_val, 1)
 
         cam = ((weights * target).sum(1) + 1)
         cam = F.relu(cam)
